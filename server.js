@@ -6,6 +6,7 @@ const path = require('path');
 const store = require('./src/store');
 const { verifyAll } = require('./src/verify');
 const { checkInventory } = require('./src/inventory');
+const { previewBatch, hashRows } = require('./src/batch');
 
 const app = express();
 const PORT = Number(process.env.PORT) || 3000;
@@ -38,6 +39,7 @@ function asyncRoute(handler) {
 /* ---------------- 读取 / 核验 ---------------- */
 
 app.get('/api/state', (req, res) => {
+  // data 自带 rev（数据版本号），一并下发供批量预演核对
   const data = store.getData();
   res.json({ warehouse: store.WAREHOUSE, ...data, verification: verifyAll(data) });
 });
@@ -214,6 +216,97 @@ app.delete('/api/records/:id', (req, res) => {
   res.status(204).end();
 });
 
+/* ---------------- 批量交接预演（预演不落盘，提交一次写入） ---------------- */
+
+// 预演票据只保存在内存中（不落盘）：记录预演时的数据版本与整批内容指纹，
+// 提交时逐项核对，版本过期或内容改变都要求重新预演。
+const PREVIEW_TTL_MS = 10 * 60 * 1000;
+const MAX_BATCH_ROWS = 200;
+const previews = new Map(); // previewId -> { baseRev, rowsHash, canCommit, createdAt }
+
+function sweepPreviews() {
+  const now = Date.now();
+  for (const [id, p] of previews) {
+    if (now - p.createdAt > PREVIEW_TTL_MS) previews.delete(id);
+  }
+}
+
+function conflict409(res, message) {
+  return res.status(409).json({ error: message, needPreview: true });
+}
+
+/** 整批校验：逐行沿用单条记录校验，错误信息冠以批次行号 */
+function validateBatchRows(body, data) {
+  if (!Array.isArray(body.rows)) throw new Error('批次行（rows）必须是数组');
+  if (body.rows.length === 0) throw new Error('请至少填写一行交接记录');
+  if (body.rows.length > MAX_BATCH_ROWS) throw new Error(`单批次最多 ${MAX_BATCH_ROWS} 行`);
+  return body.rows.map((row, i) => {
+    try {
+      return validateRecord(row || {}, data);
+    } catch (err) {
+      throw new Error(`第 ${i + 1} 行：${err.message}`);
+    }
+  });
+}
+
+app.post('/api/records/batch/preview', asyncRoute((req, res) => {
+  const data = store.getData();
+  let rows;
+  try {
+    rows = validateBatchRows(req.body || {}, data);
+  } catch (err) {
+    return badRequest(res, err.message);
+  }
+
+  // 纯读取 + 即时重放，不写入任何数据
+  const result = previewBatch(data, rows);
+
+  sweepPreviews();
+  const previewId = store.newId('pv');
+  previews.set(previewId, {
+    baseRev: data.rev,
+    rowsHash: hashRows(rows),
+    canCommit: result.canCommit,
+    createdAt: Date.now(),
+  });
+
+  res.json({ previewId, baseRev: data.rev, rows, ...result });
+}));
+
+app.post('/api/records/batch/commit', asyncRoute((req, res) => {
+  const body = req.body || {};
+  const data = store.getData();
+
+  const ticket = body.previewId ? previews.get(String(body.previewId)) : null;
+  if (!ticket || Date.now() - ticket.createdAt > PREVIEW_TTL_MS) {
+    return conflict409(res, '预演不存在或已过期，请重新预演');
+  }
+  if (ticket.baseRev !== data.rev) {
+    return conflict409(res, '预演后数据已被修改（数据版本过期），请重新预演');
+  }
+
+  let rows;
+  try {
+    rows = validateBatchRows(body, data);
+  } catch (err) {
+    return badRequest(res, err.message);
+  }
+  if (ticket.rowsHash !== hashRows(rows)) {
+    return conflict409(res, '批次内容在预演后已改变，请重新预演');
+  }
+  if (!ticket.canCommit) {
+    return conflict409(res, '预演结果存在冲突，禁止提交；请调整批次后重新预演');
+  }
+
+  // 一次写入全部记录：单次 saveRecords（临时文件 + 原子重命名），不留部分记录
+  const now = Date.now();
+  const newRecords = rows.map((f, i) => ({ id: store.newId('r'), ...f, createdAt: now + i }));
+  store.saveRecords([...data.records, ...newRecords]);
+  previews.delete(String(body.previewId));
+
+  res.status(201).json({ inserted: newRecords.length, records: newRecords, rev: store.getData().rev });
+}));
+
 /* ---------------- 错误兜底 ---------------- */
 
 app.use((err, req, res, next) => {
@@ -221,8 +314,12 @@ app.use((err, req, res, next) => {
   res.status(500).json({ error: '服务器内部错误' });
 });
 
-app.listen(PORT, () => {
-  // 启动时确保数据文件存在（首次启动写入初始数据）
-  store.getData();
-  console.log(`演出道具交接核验应用已启动: http://localhost:${PORT}`);
-});
+if (require.main === module) {
+  app.listen(PORT, () => {
+    // 启动时确保数据文件存在（首次启动写入初始数据）
+    store.getData();
+    console.log(`演出道具交接核验应用已启动: http://localhost:${PORT}`);
+  });
+}
+
+module.exports = app;

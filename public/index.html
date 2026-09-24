@@ -19,6 +19,7 @@
       <div class="topbar-actions">
         <button id="btn-add-prop" class="btn">＋ 录入道具</button>
         <button id="btn-add-record" class="btn btn-primary">＋ 录入交接记录</button>
+        <button id="btn-batch" class="btn">🧪 批量交接预演</button>
         <button id="btn-inventory" class="btn btn-accent">🔍 现场盘点</button>
         <button id="btn-reverify" class="btn" title="重新读取记录并按时间重放">↻ 重新核验</button>
       </div>
@@ -153,6 +154,30 @@
       <div class="dialog-actions">
         <button type="button" class="btn" data-close>取消</button>
         <button type="submit" class="btn btn-primary" id="record-save">保存</button>
+      </div>
+    </form>
+  </dialog>
+
+  <!-- 批量交接预演弹窗 -->
+  <dialog id="batch-dialog" class="dialog dialog-xwide">
+    <form method="dialog" id="batch-form">
+      <h3>批量交接预演</h3>
+      <p class="dialog-tip">
+        按行填写<strong>道具、分钟、交出者、接收者</strong>（校验规则与单条记录一致）。
+        「开始预演」会把整批记录与当前数据合并，按同分钟唯一链规则重放，逐件给出提交后的持有人或冲突，
+        并定位涉及的批次行号；预演<strong>不落盘</strong>。
+        受影响道具原本已冲突或合并后冲突时禁止提交；全部通过后「确认提交」一次写入全部记录。
+      </p>
+      <div class="inv-rows-bar">
+        <span class="inv-rows-title">批次行</span>
+        <button type="button" class="btn btn-sm" id="btn-batch-addrow">＋ 添加一行</button>
+      </div>
+      <div id="batch-rows" class="batch-rows"></div>
+      <div id="batch-result" class="batch-result hidden"></div>
+      <div class="dialog-actions">
+        <button type="button" class="btn" data-close>取消</button>
+        <button type="button" class="btn" id="btn-batch-preview">🧪 开始预演</button>
+        <button type="submit" class="btn btn-primary" id="btn-batch-commit" disabled>确认提交</button>
       </div>
     </form>
   </dialog>

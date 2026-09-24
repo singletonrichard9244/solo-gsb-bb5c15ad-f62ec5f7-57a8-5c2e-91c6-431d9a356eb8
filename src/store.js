@@ -52,7 +52,7 @@ function seedData() {
     { id: 'r_se1', propId: 'p_seal', minute: 1, from: WAREHOUSE, to: '周八', note: '', createdAt: now },
     { id: 'r_se2', propId: 'p_seal', minute: 6, from: '周八', to: '孙七', note: '', createdAt: now + 1 },
   ];
-  return { version: 1, props, records };
+  return { version: 1, rev: 0, props, records };
 }
 
 function ensureLoaded() {
@@ -72,6 +72,8 @@ function ensureLoaded() {
       if (!Array.isArray(parsed.props) || !Array.isArray(parsed.records)) {
         throw new Error('数据结构无效：props/records 必须为数组');
       }
+      // 数据版本号：每次落盘自增，批量预演以此核对数据是否在预演后被修改
+      if (typeof parsed.rev !== 'number') parsed.rev = 0;
       cache = parsed;
     } catch (err) {
       const backup = `${DATA_FILE}.corrupt.${Date.now()}`;
@@ -85,6 +87,7 @@ function ensureLoaded() {
 }
 
 function persist() {
+  cache.rev = (typeof cache.rev === 'number' ? cache.rev : 0) + 1;
   const tmp = `${DATA_FILE}.tmp`;
   fs.writeFileSync(tmp, JSON.stringify(cache, null, 2), 'utf8');
   fs.renameSync(tmp, DATA_FILE);

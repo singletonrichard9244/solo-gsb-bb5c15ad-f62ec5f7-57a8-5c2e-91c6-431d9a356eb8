@@ -5,6 +5,8 @@
 let state = { props: [], records: [], verification: null, warehouse: '仓库' };
 let editingPropId = null;
 let editingRecordId = null;
+let batchPreview = null; // 最近一次批量预演结果（含 previewId）
+let batchDirty = true;   // 批次行在预演后是否又被修改
 
 const $ = (sel) => document.querySelector(sel);
 const els = {
@@ -46,6 +48,15 @@ const els = {
   invBannerOk: $('#inv-banner-ok'),
   invTableBody: document.querySelector('#inv-table tbody'),
   btnInvClose: $('#btn-inv-close'),
+  // 批量交接预演
+  btnBatch: $('#btn-batch'),
+  batchDialog: $('#batch-dialog'),
+  batchForm: $('#batch-form'),
+  batchRows: $('#batch-rows'),
+  btnBatchAddRow: $('#btn-batch-addrow'),
+  btnBatchPreview: $('#btn-batch-preview'),
+  btnBatchCommit: $('#btn-batch-commit'),
+  batchResult: $('#batch-result'),
 };
 
 const STATUS_TEXT = {
@@ -385,6 +396,39 @@ function bindEvents() {
   });
   els.btnInvClose.addEventListener('click', () => els.invPanel.classList.add('hidden'));
 
+  // 批量交接预演
+  els.btnBatch.addEventListener('click', openBatchDialog);
+  els.btnBatchAddRow.addEventListener('click', () => {
+    els.batchRows.insertAdjacentHTML('beforeend', batchRowHtml());
+    renumberBatchRows();
+    markBatchDirty();
+    const rows = els.batchRows.querySelectorAll('.batch-row');
+    rows[rows.length - 1].querySelector('.batch-minute').focus();
+  });
+  els.batchRows.addEventListener('click', (e) => {
+    const del = e.target.closest?.('.batch-del');
+    if (!del) return;
+    if (els.batchRows.querySelectorAll('.batch-row').length <= 1) {
+      toast('至少保留一行；要放弃本批次请点「取消」', true);
+      return;
+    }
+    del.closest('.batch-row').remove();
+    renumberBatchRows();
+    markBatchDirty();
+  });
+  els.batchRows.addEventListener('input', markBatchDirty);
+  els.batchRows.addEventListener('change', markBatchDirty);
+  els.btnBatchPreview.addEventListener('click', runBatchPreview);
+  els.batchForm.addEventListener('submit', (e) => {
+    e.preventDefault();
+    submitBatch();
+  });
+  // 点击冲突卡片中的批次行号，滚动定位并高亮对应行
+  els.batchResult.addEventListener('click', (e) => {
+    const link = e.target.closest?.('[data-batch-row]');
+    if (link) locateBatchRow(Number(link.dataset.batchRow));
+  });
+
   document.querySelectorAll('[data-close]').forEach((b) =>
     b.addEventListener('click', () => b.closest('dialog').close()));
 
@@ -455,6 +499,178 @@ function bindEvents() {
 
 function locateRecord(id) {
   const row = document.querySelector(`tr[data-record-id="${CSS.escape(id)}"]`);
+  if (!row) return;
+  row.scrollIntoView({ behavior: 'smooth', block: 'center' });
+  row.classList.remove('flash');
+  void row.offsetWidth; // 重启动画
+  row.classList.add('flash');
+}
+
+/* ==================== 批量交接预演 ==================== */
+
+function batchPropOptions() {
+  return state.props
+    .map((p) => `<option value="${esc(p.id)}">${esc(p.name)}</option>`)
+    .join('');
+}
+
+function batchRowHtml() {
+  return `
+    <div class="batch-row">
+      <span class="batch-row-no"></span>
+      <select class="batch-prop" required title="道具">${batchPropOptions()}</select>
+      <input type="number" class="batch-minute" min="0" step="1" required placeholder="分钟" />
+      <input type="text" class="batch-from" maxlength="30" required list="people-list" placeholder="交出者" />
+      <input type="text" class="batch-to" maxlength="30" required list="people-list" placeholder="接收者" />
+      <input type="text" class="batch-note" maxlength="100" placeholder="备注（可选）" />
+      <button type="button" class="btn btn-sm btn-danger batch-del" title="删除此行">✕</button>
+    </div>`;
+}
+
+function renumberBatchRows() {
+  [...els.batchRows.querySelectorAll('.batch-row')].forEach((row, i) => {
+    row.querySelector('.batch-row-no').textContent = i + 1;
+  });
+}
+
+function collectBatchRows() {
+  return [...els.batchRows.querySelectorAll('.batch-row')].map((row) => ({
+    propId: row.querySelector('.batch-prop').value,
+    minute: row.querySelector('.batch-minute').value,
+    from: row.querySelector('.batch-from').value.trim(),
+    to: row.querySelector('.batch-to').value.trim(),
+    note: row.querySelector('.batch-note').value.trim(),
+  }));
+}
+
+function showBatchStale(msg) {
+  const el = els.batchResult.querySelector('.batch-stale');
+  if (!el) return;
+  el.textContent = msg;
+  el.classList.remove('hidden');
+}
+
+// 预演后任何行内容变动：结果失效、禁止提交（服务端还会再核对版本与整批内容）
+function markBatchDirty() {
+  batchDirty = true;
+  els.btnBatchCommit.disabled = true;
+  if (batchPreview) showBatchStale('批次内容已修改，预演结果失效，请重新预演。');
+}
+
+function openBatchDialog() {
+  if (state.props.length === 0) {
+    toast('请先录入道具，再使用批量交接预演', true);
+    return;
+  }
+  batchPreview = null;
+  batchDirty = true;
+  els.btnBatchCommit.disabled = true;
+  els.batchResult.classList.add('hidden');
+  els.batchResult.innerHTML = '';
+  els.batchRows.innerHTML = [batchRowHtml(), batchRowHtml(), batchRowHtml()].join('');
+  renumberBatchRows();
+  els.batchDialog.showModal();
+}
+
+function batchHolderText(p) {
+  if (p.statusAfter === 'RETURNED') return `提交后已归仓（持有人：${esc(state.warehouse)}）`;
+  return `提交后持有人：「${esc(p.holderAfter)}」`;
+}
+
+function batchPropCard(p) {
+  const rowsText = `批次行：${p.rowNos.map((n) => `第${n}行`).join('、')}`;
+  if (p.blocked) {
+    let detail;
+    if (p.preConflict) {
+      detail = `原本已冲突：第${p.preConflict.minute}分钟，${esc(p.preConflict.reason)}`;
+    } else {
+      const c = p.conflict;
+      const links = c.batchRows.map((n) => `<a data-batch-row="${n}">第${n}行</a>`).join('、') || '（未直接涉及）';
+      const existing = c.recordIds.length
+        ? `；命中既有记录：${c.recordIds.map((id) => shortId(id)).join('、')}`
+        : '';
+      detail = `合并后冲突：第${c.minute}分钟，${esc(c.reason)}<br>涉及批次行：${links}${esc(existing)}`;
+    }
+    return `
+      <div class="batch-prop-card blocked">
+        <div class="batch-prop-head">✕ ${esc(p.propName)} <span class="batch-prop-rows">（${rowsText}）</span></div>
+        <div class="batch-prop-detail">${detail}</div>
+        <div class="batch-prop-detail">禁止提交：${esc(p.blockReason)}</div>
+      </div>`;
+  }
+  const warn = p.statusAfter === 'NOT_RETURNED' ? '<span class="badge badge-warn">演出结束未归仓</span> ' : '';
+  return `
+    <div class="batch-prop-card ok">
+      <div class="batch-prop-head">✓ ${esc(p.propName)} ${warn}<span class="batch-prop-rows">（${rowsText}）</span></div>
+      <div class="batch-prop-detail">${batchHolderText(p)}；合并后共重放 ${p.replayedAfter} 条记录。</div>
+    </div>`;
+}
+
+function renderBatchResult(result) {
+  const s = result.summary;
+  const banner = result.canCommit
+    ? `<div class="banner banner-ok batch-banner">预演通过：${s.affectedProps} 件受影响道具均可接续，可「确认提交」一次写入全部 ${s.totalRows} 条记录。</div>`
+    : `<div class="banner banner-error batch-banner">存在冲突：${s.blockedProps} / ${s.affectedProps} 件受影响道具不可提交，禁止提交；请调整批次后重新预演。</div>`;
+  els.batchResult.innerHTML = `
+    <div class="banner banner-error batch-stale hidden"></div>
+    ${banner}
+    <div class="batch-summary">共 ${s.totalRows} 行 · 涉及 ${s.affectedProps} 件道具：✓ ${s.okProps} 件可提交，✕ ${s.blockedProps} 件冲突</div>
+    ${result.props.map(batchPropCard).join('')}`;
+  els.batchResult.classList.remove('hidden');
+}
+
+// 冲突涉及的批次行整行标红
+function markBatchConflictRows(result) {
+  els.batchRows.querySelectorAll('.batch-row').forEach((r) => r.classList.remove('batch-row-conflict'));
+  result.props.forEach((p) => {
+    if (!p.conflict) return;
+    p.conflict.batchRows.forEach((n) => {
+      const row = els.batchRows.querySelectorAll('.batch-row')[n - 1];
+      if (row) row.classList.add('batch-row-conflict');
+    });
+  });
+}
+
+async function runBatchPreview() {
+  try {
+    const result = await api('/api/records/batch/preview', {
+      method: 'POST',
+      body: JSON.stringify({ rows: collectBatchRows() }),
+    });
+    batchPreview = result;
+    batchDirty = false;
+    els.btnBatchCommit.disabled = !result.canCommit;
+    renderBatchResult(result);
+    markBatchConflictRows(result);
+  } catch (err) {
+    toast(err.message, true);
+  }
+}
+
+async function submitBatch() {
+  if (!batchPreview || batchDirty) {
+    toast('请先完成预演，且预演后未修改批次内容', true);
+    return;
+  }
+  try {
+    const res = await api('/api/records/batch/commit', {
+      method: 'POST',
+      body: JSON.stringify({ previewId: batchPreview.previewId, rows: collectBatchRows() }),
+    });
+    els.batchDialog.close();
+    toast(`已一次写入 ${res.inserted} 条交接记录`);
+    await loadState(); // 刷新记录列表与核验结果
+  } catch (err) {
+    // 版本过期 / 内容改变 / 存在冲突：一律作废本次预演，要求重新预演
+    batchDirty = true;
+    els.btnBatchCommit.disabled = true;
+    showBatchStale(`${err.message}。`);
+    toast(err.message, true);
+  }
+}
+
+function locateBatchRow(rowNo) {
+  const row = els.batchRows.querySelectorAll('.batch-row')[rowNo - 1];
   if (!row) return;
   row.scrollIntoView({ behavior: 'smooth', block: 'center' });
   row.classList.remove('flash');
