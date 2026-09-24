@@ -52,7 +52,7 @@ function seedData() {
     { id: 'r_se1', propId: 'p_seal', minute: 1, from: WAREHOUSE, to: '周八', note: '', createdAt: now },
     { id: 'r_se2', propId: 'p_seal', minute: 6, from: '周八', to: '孙七', note: '', createdAt: now + 1 },
   ];
-  return { version: 1, props, records };
+  return { version: 1, revision: 0, props, records };
 }
 
 function ensureLoaded() {
@@ -72,6 +72,8 @@ function ensureLoaded() {
       if (!Array.isArray(parsed.props) || !Array.isArray(parsed.records)) {
         throw new Error('数据结构无效：props/records 必须为数组');
       }
+      // 旧数据文件没有数据版本号时补 0（每次写入都会递增，供批量预演核对）
+      if (!Number.isInteger(parsed.revision) || parsed.revision < 0) parsed.revision = 0;
       cache = parsed;
     } catch (err) {
       const backup = `${DATA_FILE}.corrupt.${Date.now()}`;
@@ -94,13 +96,20 @@ function getData() {
   return ensureLoaded();
 }
 
+/** 数据版本号：每次写入（道具或记录）递增，批量预演 / 提交据此核对数据是否被改动 */
+function getRevision() {
+  return ensureLoaded().revision;
+}
+
 function saveProps(props) {
   cache.props = props;
+  cache.revision = (cache.revision || 0) + 1;
   persist();
 }
 
 function saveRecords(records) {
   cache.records = records;
+  cache.revision = (cache.revision || 0) + 1;
   persist();
 }
 
@@ -108,6 +117,7 @@ module.exports = {
   WAREHOUSE,
   newId,
   getData,
+  getRevision,
   saveProps,
   saveRecords,
 };

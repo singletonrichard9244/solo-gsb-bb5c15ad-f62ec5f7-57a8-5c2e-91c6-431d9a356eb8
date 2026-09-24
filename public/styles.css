@@ -67,6 +67,8 @@ body {
 .btn-primary:hover { background: #f2e8e8; }
 .btn-accent { background: #d9a441; border-color: #d9a441; color: #2a1c00; font-weight: 600; }
 .btn-accent:hover { background: #e3b55c; }
+.btn-batch { background: #2e7d5b; border-color: #2e7d5b; color: #fff; font-weight: 600; }
+.btn-batch:hover { background: #37926c; }
 main .btn {
   border-color: var(--line);
   background: var(--panel);
@@ -398,6 +400,67 @@ main .btn:hover { background: var(--muted-bg); color: var(--ink); }
 .inv-row .inv-del { flex: 0 0 auto; }
 
 .hidden { display: none !important; }
+
+/* ---------- 批量交接预演 ---------- */
+.dialog-xwide { width: min(780px, calc(100vw - 32px)); }
+.batch-row { display: flex; gap: 8px; align-items: center; }
+.batch-row select, .batch-row input {
+  padding: 8px 10px;
+  border: 1px solid #cfd5de;
+  border-radius: 8px;
+  font-size: 14px;
+  font-family: inherit;
+  background: #fff;
+}
+.batch-row select:focus, .batch-row input:focus {
+  outline: none;
+  border-color: var(--accent);
+  box-shadow: 0 0 0 3px rgba(29, 78, 137, 0.15);
+}
+.batch-rowno {
+  flex: 0 0 32px;
+  text-align: right;
+  color: var(--ink-soft);
+  font-size: 12px;
+  font-variant-numeric: tabular-nums;
+}
+.batch-prop { flex: 1.2 1 0; min-width: 0; }
+.batch-minute { flex: 0 0 84px; }
+.batch-from, .batch-to { flex: 1 1 0; min-width: 0; }
+.batch-row .batch-del { flex: 0 0 auto; }
+
+.batch-result { margin: 2px 0 12px; display: flex; flex-direction: column; gap: 10px; }
+.batch-banner { margin-bottom: 0; }
+.batch-prop-card {
+  border: 1px solid var(--line);
+  border-radius: 8px;
+  padding: 10px 12px;
+  font-size: 13px;
+  background: #fcfcfd;
+}
+.batch-prop-card.blocked { border-color: #f3c2bd; background: #fffafa; }
+.batch-prop-head {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 10px;
+  flex-wrap: wrap;
+  margin-bottom: 6px;
+}
+.batch-rows-chips { display: inline-flex; gap: 6px; align-items: center; font-size: 12px; color: var(--ink-soft); }
+.batch-line { color: var(--ink-soft); margin: 3px 0; }
+.batch-line-ok { color: var(--ok); }
+.batch-line-bad { color: var(--error); }
+.batch-loc { font-size: 12px; color: var(--ink-soft); }
+.batch-block {
+  margin-top: 6px;
+  padding: 6px 10px;
+  border-radius: 6px;
+  background: var(--error-bg);
+  color: var(--error);
+  font-size: 12.5px;
+}
+#btn-batch-commit:disabled { opacity: 0.45; cursor: not-allowed; }
 
 /* ---------- 响应式 ---------- */
 @media (max-width: 980px) {

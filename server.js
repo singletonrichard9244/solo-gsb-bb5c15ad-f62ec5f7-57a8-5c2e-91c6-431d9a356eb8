@@ -6,6 +6,7 @@ const path = require('path');
 const store = require('./src/store');
 const { verifyAll } = require('./src/verify');
 const { checkInventory } = require('./src/inventory');
+const { rehearseBatch, hashBatch } = require('./src/batch');
 
 const app = express();
 const PORT = Number(process.env.PORT) || 3000;
@@ -214,6 +215,85 @@ app.delete('/api/records/:id', (req, res) => {
   res.status(204).end();
 });
 
+/* ---------------- 批量交接：预演（不落盘）+ 提交（一次写入） ---------------- */
+
+/** 整批校验：沿用单条记录校验规则，错误信息带批次行号 */
+function validateBatchRows(body, data) {
+  if (!Array.isArray(body.rows)) throw new Error('批次行（rows）必须是数组');
+  if (body.rows.length === 0) throw new Error('请至少填写一行交接记录');
+  if (body.rows.length > 200) throw new Error('单次批量最多 200 行');
+  return body.rows.map((r, i) => {
+    try {
+      return validateRecord(r || {}, data);
+    } catch (err) {
+      throw new Error(`第 ${i + 1} 行：${err.message}`);
+    }
+  });
+}
+
+// 预演：整批记录与当前数据合并后按同分钟唯一链规则重放，逐件给出提交后的
+// 持有人或冲突（定位批次行号）；受影响道具原本已冲突或合并后冲突时禁止提交。不落盘。
+app.post('/api/records/batch/rehearse', asyncRoute((req, res) => {
+  const data = store.getData();
+  let rows;
+  try {
+    rows = validateBatchRows(req.body || {}, data);
+  } catch (err) {
+    return badRequest(res, err.message);
+  }
+  const result = rehearseBatch(data, rows);
+  res.json({
+    dataVersion: store.getRevision(),
+    batchHash: hashBatch(rows),
+    ...result,
+  });
+}));
+
+// 提交：核对预演时的数据版本与整批内容，任一不符则要求重新预演；
+// 通过后一次写入全部记录（单次落盘，不会留下部分记录）。
+app.post('/api/records/batch/commit', asyncRoute((req, res) => {
+  const body = req.body || {};
+  const data = store.getData();
+
+  let rows;
+  try {
+    rows = validateBatchRows(body, data);
+  } catch (err) {
+    return badRequest(res, err.message);
+  }
+
+  // 1) 数据版本：预演之后任何增删改都会使版本号递增
+  const dataVersion = Number(body.dataVersion);
+  if (!Number.isInteger(dataVersion) || dataVersion !== store.getRevision()) {
+    return res.status(409).json({
+      error: '数据在预演后已被修改，请重新预演',
+      code: 'REHEARSAL_STALE',
+    });
+  }
+  // 2) 整批内容：与预演时的指纹比对
+  if (typeof body.batchHash !== 'string' || body.batchHash !== hashBatch(rows)) {
+    return res.status(409).json({
+      error: '批次内容与预演时不一致，请重新预演',
+      code: 'REHEARSAL_CHANGED',
+    });
+  }
+  // 3) 复核预演结论：受影响道具原本已冲突或合并后冲突时禁止提交
+  //    （版本与内容均未变时重放结果与预演一致，此处为防止绕过预演直接提交）
+  const rehearsal = rehearseBatch(data, rows);
+  if (!rehearsal.canCommit) {
+    return res.status(409).json({
+      error: '整批合并后存在冲突道具，已禁止提交，请调整或处理后重新预演',
+      code: 'REHEARSAL_CONFLICT',
+      rehearsal,
+    });
+  }
+
+  const now = Date.now();
+  const created = rows.map((r, i) => ({ id: store.newId('r'), ...r, createdAt: now + i }));
+  store.saveRecords([...data.records, ...created]); // 单次原子写入全部记录
+  res.status(201).json({ created: created.length, records: created });
+}));
+
 /* ---------------- 错误兜底 ---------------- */
 
 app.use((err, req, res, next) => {
@@ -221,8 +301,12 @@ app.use((err, req, res, next) => {
   res.status(500).json({ error: '服务器内部错误' });
 });
 
-app.listen(PORT, () => {
-  // 启动时确保数据文件存在（首次启动写入初始数据）
-  store.getData();
-  console.log(`演出道具交接核验应用已启动: http://localhost:${PORT}`);
-});
+if (require.main === module) {
+  app.listen(PORT, () => {
+    // 启动时确保数据文件存在（首次启动写入初始数据）
+    store.getData();
+    console.log(`演出道具交接核验应用已启动: http://localhost:${PORT}`);
+  });
+}
+
+module.exports = app;

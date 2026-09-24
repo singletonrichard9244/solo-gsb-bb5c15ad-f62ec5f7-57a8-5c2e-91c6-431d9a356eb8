@@ -46,6 +46,14 @@ const els = {
   invBannerOk: $('#inv-banner-ok'),
   invTableBody: document.querySelector('#inv-table tbody'),
   btnInvClose: $('#btn-inv-close'),
+  // 批量交接预演
+  btnBatch: $('#btn-batch'),
+  batchDialog: $('#batch-dialog'),
+  batchForm: $('#batch-form'),
+  batchRows: $('#batch-rows'),
+  btnBatchAddRow: $('#btn-batch-addrow'),
+  batchResult: $('#batch-result'),
+  btnBatchCommit: $('#btn-batch-commit'),
 };
 
 const STATUS_TEXT = {
@@ -385,6 +393,34 @@ function bindEvents() {
   });
   els.btnInvClose.addEventListener('click', () => els.invPanel.classList.add('hidden'));
 
+  // 批量交接预演
+  els.btnBatch.addEventListener('click', openBatchDialog);
+  els.btnBatchAddRow.addEventListener('click', () => {
+    els.batchRows.insertAdjacentHTML('beforeend', batchRowHtml());
+    renumberBatchRows();
+    invalidateBatchRehearsal();
+    els.batchRows.querySelector('.batch-row:last-child .batch-minute').focus();
+  });
+  els.batchRows.addEventListener('click', (e) => {
+    const del = e.target.closest?.('.batch-del');
+    if (!del) return;
+    if (els.batchRows.children.length <= 1) {
+      toast('至少保留一行；要放弃批量交接请点「取消」', true);
+      return;
+    }
+    del.closest('.batch-row').remove();
+    renumberBatchRows();
+    invalidateBatchRehearsal();
+  });
+  // 批次内容一经修改，旧预演结果作废
+  els.batchRows.addEventListener('input', invalidateBatchRehearsal);
+  els.batchRows.addEventListener('change', invalidateBatchRehearsal);
+  els.batchForm.addEventListener('submit', (e) => {
+    e.preventDefault();
+    submitBatchRehearsal();
+  });
+  els.btnBatchCommit.addEventListener('click', commitBatch);
+
   document.querySelectorAll('[data-close]').forEach((b) =>
     b.addEventListener('click', () => b.closest('dialog').close()));
 
@@ -582,6 +618,183 @@ async function submitInventory() {
     toast('盘点完成（结果仅本次有效，未改动交接记录）');
   } catch (err) {
     toast(err.message, true);
+  }
+}
+
+/* ==================== 批量交接预演 ==================== */
+
+const BATCH_STATUS_INLINE = {
+  RETURNED: '已归仓',
+  NOT_RETURNED: '结束未归仓',
+  CONFLICT: '交接链冲突',
+  NO_RECORDS: '无交接记录',
+};
+
+// 最近一次预演结果（提交时须原样带回，服务端核对数据版本与整批内容）
+let batchRehearsal = null;
+
+function batchRowHtml() {
+  const options = state.props
+    .map((p) => `<option value="${esc(p.id)}">${esc(p.name)}</option>`)
+    .join('');
+  return `
+    <div class="batch-row">
+      <span class="batch-rowno"></span>
+      <select class="batch-prop">${options}</select>
+      <input type="number" class="batch-minute" min="0" step="1" placeholder="分钟" />
+      <input type="text" class="batch-from" maxlength="30" list="people-list" placeholder="交出者" />
+      <input type="text" class="batch-to" maxlength="30" list="people-list" placeholder="接收者" />
+      <button type="button" class="btn btn-sm btn-danger batch-del" title="删除此行">✕</button>
+    </div>`;
+}
+
+function renumberBatchRows() {
+  [...els.batchRows.querySelectorAll('.batch-row')].forEach((row, i) => {
+    row.querySelector('.batch-rowno').textContent = `#${i + 1}`;
+  });
+}
+
+/** 批次内容被修改后，旧预演结果作废，须重新预演 */
+function invalidateBatchRehearsal() {
+  batchRehearsal = null;
+  els.btnBatchCommit.hidden = true;
+  els.btnBatchCommit.disabled = true;
+  els.batchResult.classList.add('hidden');
+  els.batchResult.innerHTML = '';
+}
+
+function resetBatchDialog() {
+  invalidateBatchRehearsal();
+  els.batchRows.innerHTML = [batchRowHtml(), batchRowHtml(), batchRowHtml()].join('');
+  renumberBatchRows();
+}
+
+function openBatchDialog() {
+  if (state.props.length === 0) {
+    toast('请先录入至少一件道具', true);
+    return;
+  }
+  resetBatchDialog();
+  els.batchDialog.showModal();
+}
+
+function collectBatchRows() {
+  const rows = [...els.batchRows.querySelectorAll('.batch-row')];
+  if (rows.length === 0) throw new Error('请至少填写一行交接记录');
+  return rows.map((row, i) => {
+    const no = i + 1;
+    const propId = row.querySelector('.batch-prop').value;
+    const minuteRaw = row.querySelector('.batch-minute').value.trim();
+    const from = row.querySelector('.batch-from').value.trim();
+    const to = row.querySelector('.batch-to').value.trim();
+    if (minuteRaw === '' || !from || !to) {
+      throw new Error(`第 ${no} 行：请填写分钟、交出者、接收者（或删除该行）`);
+    }
+    const minute = Number(minuteRaw);
+    if (!Number.isInteger(minute) || minute < 0) {
+      throw new Error(`第 ${no} 行：分钟必须是不小于 0 的整数`);
+    }
+    if (from === to) throw new Error(`第 ${no} 行：交出者与接收者不能相同`);
+    return { propId, minute, from, to, note: '' };
+  });
+}
+
+function batchBeforeLine(p) {
+  if (p.before.conflict) {
+    const c = p.before.conflict;
+    return `<div class="batch-line batch-line-bad">提交前：✕ 原本已冲突（第${c.minute}分钟）——${esc(c.reason)}</div>`;
+  }
+  return `<div class="batch-line">提交前：持有人「${esc(p.before.holder)}」（${BATCH_STATUS_INLINE[p.before.status]}）</div>`;
+}
+
+function batchAfterLine(p) {
+  if (p.after.conflict) {
+    const c = p.after.conflict;
+    const typeText = c.type === 'AMBIGUOUS' ? '多条可接续记录（交接链不唯一）' : '剩余记录无法接续（断链）';
+    const loc = [
+      c.batchRows.length ? `涉及批次行：${c.batchRows.map((n) => `#${n}`).join('、')}` : '',
+      c.existingRecordIds.length ? `涉及既有记录：${c.existingRecordIds.map((id) => shortId(id)).join('、')}` : '',
+    ].filter(Boolean).join('；');
+    return `<div class="batch-line batch-line-bad">提交后：✕ 第${c.minute}分钟冲突（${typeText}）<br>${esc(c.reason)}${loc ? `<br><span class="batch-loc">${esc(loc)}</span>` : ''}</div>`;
+  }
+  return `<div class="batch-line batch-line-ok">提交后：持有人「${esc(p.after.holder)}」（${BATCH_STATUS_INLINE[p.after.status]}）</div>`;
+}
+
+function renderBatchResult(result) {
+  const s = result.summary;
+  const banner = result.canCommit
+    ? `<div class="banner banner-ok batch-banner">预演通过（未落盘）：${s.affectedProps} 件道具、共 ${s.rowCount} 条记录均可提交，确认后将一次写入全部记录。</div>`
+    : `<div class="banner banner-error batch-banner">预演发现 ${s.blockedProps} 件道具存在冲突，已禁止提交。请调整批次行或先处理现有冲突，然后重新预演。</div>`;
+
+  const cards = result.props.map((p) => {
+    const rowChips = p.batchRows.map((n) => `<span class="inv-chip chip-neutral">#${n}</span>`).join(' ');
+    return `
+      <div class="batch-prop-card ${p.blockReason ? 'blocked' : ''}">
+        <div class="batch-prop-head"><strong>${esc(p.propName)}</strong><span class="batch-rows-chips">批次行 ${rowChips}</span></div>
+        ${batchBeforeLine(p)}
+        ${batchAfterLine(p)}
+        ${p.blockReason ? `<div class="batch-block">⛔ 禁止提交：${esc(p.blockReason)}</div>` : ''}
+      </div>`;
+  }).join('');
+
+  els.batchResult.innerHTML = banner + cards;
+  els.batchResult.classList.remove('hidden');
+  els.btnBatchCommit.hidden = false;
+  els.btnBatchCommit.disabled = !result.canCommit;
+  els.btnBatchCommit.textContent = `✔ 确认提交（${s.rowCount} 条）`;
+}
+
+async function submitBatchRehearsal() {
+  let rows;
+  try {
+    rows = collectBatchRows();
+  } catch (err) {
+    toast(err.message, true);
+    return;
+  }
+  try {
+    const result = await api('/api/records/batch/rehearse', {
+      method: 'POST',
+      body: JSON.stringify({ rows }),
+    });
+    // 提交时须带回预演所用的数据版本与整批内容（服务端规范化后的行）
+    batchRehearsal = {
+      rows: result.rows,
+      dataVersion: result.dataVersion,
+      batchHash: result.batchHash,
+    };
+    renderBatchResult(result);
+  } catch (err) {
+    toast(err.message, true);
+  }
+}
+
+async function commitBatch() {
+  if (!batchRehearsal) {
+    toast('请先完成预演', true);
+    return;
+  }
+  try {
+    const res = await api('/api/records/batch/commit', {
+      method: 'POST',
+      body: JSON.stringify({
+        rows: batchRehearsal.rows,
+        dataVersion: batchRehearsal.dataVersion,
+        batchHash: batchRehearsal.batchHash,
+      }),
+    });
+    els.batchDialog.close();
+    resetBatchDialog();
+    await loadState(); // 刷新记录列表与核验结果
+    toast(`已一次写入 ${res.created} 条交接记录，核验已刷新`);
+  } catch (err) {
+    // 版本过期 / 内容改变 / 存在冲突：预演作废，要求重新预演
+    batchRehearsal = null;
+    els.btnBatchCommit.hidden = true;
+    els.btnBatchCommit.disabled = true;
+    els.batchResult.innerHTML =
+      `<div class="banner banner-error batch-banner">提交被拒绝：${esc(err.message)}。</div>`;
+    els.batchResult.classList.remove('hidden');
   }
 }
 
